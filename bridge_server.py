@@ -104,15 +104,38 @@ class AivocoSession:
             log.info("[%s] 📴 Aivoco session ended: %s", self.call_id, data)
             self.session_active = False
 
+        # -------------------- Old audio handlers (optional) --------------------
         @self.sio.on("audio_response")
-        async def _audio_response(data):
-            log.info("[%s] 🎤 audio_response: received keys=%s", self.call_id, list(data.keys() if isinstance(data, dict) else []))
+        async def _audio_response_file(data):
+            log.info("✅ [%s] [Aivoco] audio_response event received", self.call_id)
             await self._handle_incoming_audio_event("audio_response", data)
 
         @self.sio.on("audio_chunk")
         async def _audio_chunk(data):
             log.info("[%s] 🎶 audio_chunk: received keys=%s", self.call_id, list(data.keys() if isinstance(data, dict) else []))
             await self._handle_incoming_audio_event("audio_chunk", data)
+
+        # -------------------- Catch-all handler for all audio --------------------
+        @self.sio.on("*")
+        async def catch_all(event, data=None):
+            # Log everything
+            log.info("[%s] 📨 (Aivoco raw event) %s | data keys=%s | data preview=%s",
+                     self.call_id,
+                     event,
+                     list(data.keys()) if isinstance(data, dict) else type(data),
+                     str(data)[:200])
+            # Handle audio in any event
+            audio_keys = ("audio_response", "audio_chunk", "audio_data", "chunk", "audio")
+            if isinstance(data, dict):
+                for k in audio_keys:
+                    if k in data and data[k]:
+                        try:
+                            pcm = _b64d(data[k])
+                            log.info("[%s] 🔊 catch_all decoded audio for key=%s: %d bytes",
+                                     self.call_id, k, len(pcm))
+                            await self.out_queue.put(pcm)
+                        except Exception as e:
+                            log.error("[%s] base64 decode failed for key=%s: %s", self.call_id, k, e)
 
         @self.sio.on("text_response")
         async def _text_response(data):
@@ -123,15 +146,6 @@ class AivocoSession:
         @self.sio.on("error")
         async def _error(data):
             log.error("[%s] ⚠️ Aivoco error: %s", self.call_id, data)
-
-        # 👇 Universal event logger to capture all raw messages
-        @self.sio.on("*")
-        async def catch_all(event, data=None):
-            log.info("[%s] 📨 (Aivoco raw event) %s | data keys=%s | data preview=%s",
-                     self.call_id,
-                     event,
-                     list(data.keys()) if isinstance(data, dict) else type(data),
-                     str(data)[:200])
 
     async def _handle_incoming_audio_event(self, event_name: str, data):
         if not data:
@@ -155,13 +169,11 @@ class AivocoSession:
             pcm = _b64d(b64)
             log.info("[%s] 🔊 %s.%s decoded: %d base64 chars -> %d PCM bytes",
                      self.call_id, event_name, key, len(b64), len(pcm))
-            log.debug("[%s] HEX preview: %s", self.call_id, pcm[:20].hex())
         except Exception as e:
             log.error("[%s] %s: base64 decode failed: %s", self.call_id, event_name, e)
             return
 
         await self.out_queue.put(pcm)
-        log.debug("[%s] queued %d PCM bytes into out_queue", self.call_id, len(pcm))
 
     async def start(self):
         if not AIVOCO_KEY:
@@ -213,7 +225,6 @@ class Bridge:
                     pcm_8k = resample_pcm16_bytes(pcm_from_aivoco, AIVOCO_OUT, EXOTEL_RATE)
                     if pcm_8k:
                         buf.extend(pcm_8k)
-                        log.debug("[%s] buffered %d bytes (buf=%d)", stream_sid, len(pcm_8k), len(buf))
                 except asyncio.TimeoutError:
                     pass
 
@@ -262,7 +273,6 @@ class Bridge:
                     try:
                         pcm16_8k = _b64d(payload_b64)
                         log.info("[%s] ← received %d PCM bytes from Exotel", call_id, len(pcm16_8k))
-                        log.debug("[%s] HEX preview: %s", call_id, pcm16_8k[:20].hex())
                     except Exception as e:
                         log.error("[%s] base64 decode failed: %s", call_id, e)
                         continue
