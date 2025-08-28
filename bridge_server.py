@@ -26,7 +26,7 @@ SYSTEM_MSG   = os.getenv("SYSTEM_MESSAGE", "You are a helpful AI assistant.")
 EXOTEL_RATE      = int(os.getenv("SAMPLE_RATE_EXOTEL", 8000))    # inbound from Exotel
 AIVOCO_IN_RATE   = int(os.getenv("SAMPLE_RATE_AIVOCO", 16000))   # what we SEND to Aivoco
 DEFAULT_AIVO_OUT = int(os.getenv("SAMPLE_RATE_OUTPUT", 24000))   # typical TTS rate if not sent
-FRAME_MS_EXO_OUT = int(os.getenv("EXOTEL_FRAME_MS", 100))        # what we send back to Exotel (ms)
+FRAME_MS_EXO_OUT = int(os.getenv("EXOTEL_FRAME_MS", 100))        # kept for reference; not used in stateless path
 FRAME_MS_TO_AIVO = int(os.getenv("AIVOCO_FRAME_MS", 20))         # chunk size we emit to Aivoco (ms)
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -257,7 +257,7 @@ class AivocoSession:
             log.error("[%s] Missing AIVOCO_API_KEY", self.call_id); return
         try:
             await self.sio.connect(AIVOCO_URL, transports=["websocket"])
-            log.info("[%s] Connected to AIVOCO: %s", self.call_id, AIVOCO_URL)
+            log.info("[%s] Connected to AIVoco: %s", self.call_id, AIVOCO_URL)
         except Exception as e:
             log.exception("[%s] socketio.connect failed: %s", self.call_id, e); return
         try:
@@ -316,35 +316,27 @@ class Bridge:
         self.stats_map: Dict[object, FlowStats] = {}
 
     async def pump_aivoco_to_exotel(self, ws, stream_sid: str, aivoco: AivocoSession, stats: FlowStats):
-        """Take (sr, pcm) from Aivoco, resample to 8k and send to Exotel in FRAME_MS_EXO_OUT chunks."""
-        bytes_per_frame = int(EXOTEL_RATE * (FRAME_MS_EXO_OUT/1000.0)) * 2  # mono int16
-        buf = bytearray()
+        """Immediately forward each Aivoco chunk to Exotel without buffering."""
         try:
             while True:
-                try:
-                    out_sr, pcm = await asyncio.wait_for(aivoco.out_queue.get(), timeout=0.2)
-                    pcm_8k = resample_pcm16_bytes(pcm, out_sr, EXOTEL_RATE)
-                    if pcm_8k:
-                        buf.extend(pcm_8k)
-                        if VERBOSE_FRAMES:
-                            log.debug("[stream:%s] AIVOCO→Bridge queued %d bytes (sr=%d)", stream_sid, len(pcm_8k), out_sr)
-                except asyncio.TimeoutError:
-                    pass
+                out_sr, pcm = await aivoco.out_queue.get()
+                pcm_8k = resample_pcm16_bytes(pcm, out_sr, EXOTEL_RATE)
+                if not pcm_8k:
+                    continue
 
-                while len(buf) >= bytes_per_frame:
-                    chunk = bytes(buf[:bytes_per_frame]); del buf[:bytes_per_frame]
-                    await ws.send(json.dumps({
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {"payload": _b64e(chunk)}
-                    }))
-                    stats.exo_tx_frames += 1
-                    stats.exo_tx_bytes  += len(chunk)
-                    if VERBOSE_FRAMES:
-                        log.debug("[stream:%s] Bridge→Exotel sent %d bytes (frame %d)",
-                                  stream_sid, len(chunk), stats.exo_tx_frames)
+                # send directly to Exotel
+                await ws.send(json.dumps({
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {"payload": _b64e(pcm_8k)}
+                }))
 
-                await asyncio.sleep(0.005)
+                stats.exo_tx_frames += 1
+                stats.exo_tx_bytes  += len(pcm_8k)
+
+                if VERBOSE_FRAMES:
+                    log.debug("[stream:%s] Bridge→Exotel sent %d bytes (frame %d)",
+                              stream_sid, len(pcm_8k), stats.exo_tx_frames)
         except Exception as e:
             log.info("[stream:%s] pump → Exotel exiting: %s", stream_sid, e)
 
